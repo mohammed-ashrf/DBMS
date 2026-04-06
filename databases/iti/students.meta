@@ -1,0 +1,4 @@
+id:int:pk
+firstname:string
+lastname:string
+gpa:float
