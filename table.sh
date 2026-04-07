@@ -1,11 +1,15 @@
 #!/bin/bash
 
+function to_lower() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
 function confirm_action() {
     local prompt="$1"
 
     while true; do
         read -p "$prompt (y/n): " answer
-        case "${answer,,}" in
+        case "$(to_lower "$answer")" in
             y|yes)
                 return 0
                 ;;
@@ -146,7 +150,8 @@ function validate_value_by_type() {
             return 0
             ;;
         bool|boolean)
-            local lower_value="${value,,}"
+            local lower_value
+            lower_value="$(to_lower "$value")"
             [[ "$lower_value" =~ ^(true|false|1|0)$ ]]
             ;;
         *)
@@ -201,7 +206,7 @@ function create_table() {
         seen_column_names+="$col_name|"
 
         read -p "Enter column $i type (string/int/float/bool): " col_type
-        col_type=$(echo "$col_type" | tr '[:upper:]' '[:lower:]')
+        col_type=$(to_lower "$col_type")
         col_type="$(normalize_value "$col_type")"
 
         if [[ "$col_type" == "boolean" ]]; then
@@ -216,7 +221,7 @@ function create_table() {
         while true; do
             read -p "Is this column a primary key? (y/n): " is_pk
             is_pk="$(normalize_value "$is_pk")"
-            is_pk="${is_pk,,}"
+            is_pk="$(to_lower "$is_pk")"
 
             if [[ "$is_pk" == "y" || "$is_pk" == "yes" ]]; then
                 if [[ "$has_primary_key" -eq 1 ]]; then
