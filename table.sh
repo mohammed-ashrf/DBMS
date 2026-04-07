@@ -566,6 +566,12 @@ function update_record() {
     current_record=$(sed -n "${target_line_number}p" "$data_file")
     IFS='|' read -r -a record_values <<< "$current_record"
 
+    echo "Current record to update:"
+    for ((i=0; i<${#col_names[@]}; i++)); do
+        echo "${col_names[$i]}: ${record_values[$i]}"
+    done
+    echo "-------------------------"
+
     echo "Choose a column to update:"
     for ((i=0; i<${#col_names[@]}; i++)); do
         col_label="${col_names[$i]} (${col_types[$i]})"
