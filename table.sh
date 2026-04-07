@@ -36,6 +36,69 @@ function validate_entity_name() {
     return 0
 }
 
+function normalize_value() {
+    echo "$1" | xargs
+}
+
+function get_pk_info() {
+    local meta_file="$1"
+    local pk_col_index=-1
+    local pk_col_type=""
+    local col_type
+    local i=0
+
+    while IFS= read -r line; do
+        col_type=$(echo "$line" | cut -d: -f2-)
+        if [[ "$col_type" == *:pk ]]; then
+            pk_col_index=$i
+            pk_col_type=${col_type%%:*}
+            break
+        fi
+        ((i++))
+    done < "$meta_file"
+
+    echo "$pk_col_index|$pk_col_type"
+}
+
+function sort_data_file_by_pk() {
+    local meta_file="$1"
+    local data_file="$2"
+    local tmp_file="$data_file.tmp"
+    local pk_info
+    local pk_col_index
+    local pk_col_type
+
+    [[ ! -f "$data_file" ]] && return 0
+    [[ ! -s "$data_file" ]] && return 0
+
+    pk_info="$(get_pk_info "$meta_file")"
+    pk_col_index="${pk_info%%|*}"
+    pk_col_type="${pk_info#*|}"
+
+    if [[ "$pk_col_index" -lt 0 ]]; then
+        return 0
+    fi
+
+    if [[ "$pk_col_type" == "int" || "$pk_col_type" == "float" ]]; then
+        LC_ALL=C sort -t'|' -k$((pk_col_index+1)),$((pk_col_index+1)) -n "$data_file" > "$tmp_file" || {
+            rm -f "$tmp_file"
+            return 1
+        }
+    else
+        LC_ALL=C sort -t'|' -k$((pk_col_index+1)),$((pk_col_index+1)) "$data_file" > "$tmp_file" || {
+            rm -f "$tmp_file"
+            return 1
+        }
+    fi
+
+    mv "$tmp_file" "$data_file" || {
+        rm -f "$tmp_file"
+        return 1
+    }
+
+    return 0
+}
+
 function table_menu() {
     while true; do
         echo "************* Table Menu ****************"
@@ -65,12 +128,12 @@ function table_menu() {
 }
 
 function validate_value_by_type() {
-    local value="$1"
+    local value
     local col_type="$2"
 
+    value="$(normalize_value "$1")"
+
     [[ -z "$value" ]] && return 1
-    # Remove leading/trailing whitespace
-    value="$(echo "$value" | xargs)"
 
     case "$col_type" in
         int)
@@ -108,21 +171,38 @@ function create_table() {
         return
     fi
 
-    read -p "Enter Number of columns: " num_cols
+    while true; do
+        read -p "Enter Number of columns: " num_cols
+        num_cols="$(normalize_value "$num_cols")"
 
-    > "$meta_file" # Create meta file and clear if exists
+        if [[ "$num_cols" =~ ^[1-9][0-9]*$ ]]; then
+            break
+        fi
+
+        echo "Invalid number of columns. Please enter a positive integer."
+    done
+
     has_primary_key=0
+    column_defs=()
+    seen_column_names="|"
 
     for ((i=1; i<=num_cols; i++)); do
         read -p "Enter column $i name: " col_name
-        col_name="$(echo "$col_name" | xargs)"
+        col_name="$(normalize_value "$col_name")"
 
         if ! validate_entity_name "$col_name"; then
             return
         fi
 
+        if [[ "$seen_column_names" == *"|$col_name|"* ]]; then
+            echo "Duplicate column name '$col_name' is not allowed."
+            return
+        fi
+        seen_column_names+="$col_name|"
+
         read -p "Enter column $i type (string/int/float/bool): " col_type
         col_type=$(echo "$col_type" | tr '[:upper:]' '[:lower:]')
+        col_type="$(normalize_value "$col_type")"
 
         if [[ "$col_type" == "boolean" ]]; then
             col_type="bool"
@@ -133,15 +213,37 @@ function create_table() {
             return
         fi
 
-        if [[ "$has_primary_key" -eq 0 ]]; then
+        while true; do
             read -p "Is this column a primary key? (y/n): " is_pk
-            if [[ "$is_pk" == "y" ]]; then
+            is_pk="$(normalize_value "$is_pk")"
+            is_pk="${is_pk,,}"
+
+            if [[ "$is_pk" == "y" || "$is_pk" == "yes" ]]; then
+                if [[ "$has_primary_key" -eq 1 ]]; then
+                    echo "Only one primary key is allowed per table."
+                    continue
+                fi
                 col_type="$col_type:pk"
                 has_primary_key=1
+                break
+            elif [[ "$is_pk" == "n" || "$is_pk" == "no" ]]; then
+                break
+            else
+                echo "Please answer with y or n."
             fi
-        fi
+        done
 
-        echo "$col_name:$col_type" >> "$meta_file"
+        column_defs+=("$col_name:$col_type")
+    done
+
+    if [[ "$has_primary_key" -ne 1 ]]; then
+        echo "Table must have exactly one primary key column."
+        return
+    fi
+
+    > "$meta_file"
+    for def in "${column_defs[@]}"; do
+        echo "$def" >> "$meta_file"
     done
 
     touch "$data_file" # Create data file
@@ -153,7 +255,12 @@ function create_table() {
 
 function list_tables() {
     echo "Available Tables:"
-    ls "$current_db" | grep -E '\.meta$' | sed 's/\.meta$//'
+    tables=$(find "$current_db" -mindepth 1 -maxdepth 1 -type f -name '*.meta' -exec basename {} .meta \; | sort)
+    if [[ -z "$tables" ]]; then
+        echo "(none)"
+        return
+    fi
+    echo "$tables"
 }
 
 function drop_table() {
@@ -198,7 +305,8 @@ function insert_record() {
 
     while true; do
         record_values=()
-        pk_col_index=-1
+        pk_info="$(get_pk_info "$meta_file")"
+        pk_col_index="${pk_info%%|*}"
         col_index=0
 
         exec 3< "$meta_file"
@@ -216,7 +324,14 @@ function insert_record() {
                     return
                 fi
 
-                if validate_value_by_type "$value" "$base_col_type"; then
+                normalized_value="$(normalize_value "$value")"
+
+                if [[ "$base_col_type" == "string" && "$normalized_value" == *"|"* ]]; then
+                    echo "Invalid input. Character '|' is not allowed in string values."
+                    continue
+                fi
+
+                if validate_value_by_type "$normalized_value" "$base_col_type"; then
                     break
                 fi
 
@@ -233,11 +348,7 @@ function insert_record() {
                 fi
             done
 
-            if [[ "$col_type" == *:pk ]]; then
-                pk_col_index=$col_index
-            fi
-
-            record_values+=("$value")
+            record_values+=("$normalized_value")
             ((col_index++))
         done
         exec 3<&-
@@ -246,7 +357,7 @@ function insert_record() {
         if [[ "$pk_col_index" -ge 0 ]]; then
             pk_value="${record_values[$pk_col_index]}"
             if awk -F'|' -v pk_index=$((pk_col_index+1)) -v pk_value="$pk_value" \
-             '$pk_index == pk_value { found=1; exit } END { exit !found }' "$data_file"; then
+             'function trim(s){gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s} trim($pk_index) == pk_value { found=1; exit } END { exit !found }' "$data_file"; then
                 echo "Error: Primary key value '$pk_value' already exists. Record not inserted."
                 continue
             fi
@@ -260,6 +371,12 @@ function insert_record() {
         record=${record%|}  # Remove trailing|
 
         echo "$record" >> "$data_file"
+
+        if ! sort_data_file_by_pk "$meta_file" "$data_file"; then
+            echo "Warning: Record inserted, but failed to reorder data by primary key."
+            return
+        fi
+
         echo "Record inserted successfully."
 
         read -p "Do you want to insert another record in the same table? (y/n): " insert_another
@@ -300,10 +417,26 @@ function select_records() {
     echo "$headers"
     echo "-------------------------"
 
-    # Print records
-    while IFS= read -r record; do
-        echo "$record" | tr '|' ' '
-    done < "$data_file"
+    # Print records (ordered by PK when available)
+    pk_info="$(get_pk_info "$meta_file")"
+    pk_col_index="${pk_info%%|*}"
+    pk_col_type="${pk_info#*|}"
+
+    if [[ "$pk_col_index" -ge 0 ]]; then
+        if [[ "$pk_col_type" == "int" || "$pk_col_type" == "float" ]]; then
+            LC_ALL=C sort -t'|' -k$((pk_col_index+1)),$((pk_col_index+1)) -n "$data_file" | while IFS= read -r record; do
+                echo "$record" | tr '|' ' '
+            done
+        else
+            LC_ALL=C sort -t'|' -k$((pk_col_index+1)),$((pk_col_index+1)) "$data_file" | while IFS= read -r record; do
+                echo "$record" | tr '|' ' '
+            done
+        fi
+    else
+        while IFS= read -r record; do
+            echo "$record" | tr '|' ' '
+        done < "$data_file"
+    fi
 }
 
 
@@ -329,25 +462,24 @@ function delete_record() {
     fi
 
     read -p "Enter primary key value to delete: " pk_value
+    pk_value="$(normalize_value "$pk_value")"
 
-    # Get PK column index
-    pk_col_index=-1
-    i=0
-    while IFS= read -r line; do
-        col_type=$(echo "$line" | cut -d: -f2-)
-        if [[ "$col_type" == *:pk ]]; then
-            pk_col_index=$i
-            break
-        fi
-        ((i++))
-    done < "$meta_file"
+    # Get PK column index and type
+    pk_info="$(get_pk_info "$meta_file")"
+    pk_col_index="${pk_info%%|*}"
+    pk_col_type="${pk_info#*|}"
 
     if [ $pk_col_index -eq -1 ]; then
         echo "No primary key defined for this table."
         return
     fi
 
-    target_line_number=$(awk -F'|' -v pk_index=$((pk_col_index+1)) -v pk_value="$pk_value" '$pk_index == pk_value { print NR; exit }' "$data_file")
+    if ! validate_value_by_type "$pk_value" "$pk_col_type"; then
+        echo "Invalid primary key value. Expected $pk_col_type."
+        return
+    fi
+
+    target_line_number=$(awk -F'|' -v pk_index=$((pk_col_index+1)) -v pk_value="$pk_value" 'function trim(s){gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s} trim($pk_index) == pk_value { print NR; exit }' "$data_file")
 
     if [[ -z "$target_line_number" ]]; then
         echo "No record found with that primary key."
@@ -360,7 +492,7 @@ function delete_record() {
     fi
 
     # Delete record with matching PK value
-    awk -F'|' -v pk_index=$((pk_col_index+1)) -v pk_value="$pk_value" '$pk_index != pk_value' "$data_file" > "$data_file.tmp" && mv "$data_file.tmp" "$data_file"
+    awk -F'|' -v pk_index=$((pk_col_index+1)) -v pk_value="$pk_value" 'function trim(s){gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s} trim($pk_index) != pk_value' "$data_file" > "$data_file.tmp" && mv "$data_file.tmp" "$data_file"
     echo "Record deleted successfully."
 }
 
@@ -387,7 +519,8 @@ function update_record() {
     fi
 
     # Get column metadata and PK index
-    pk_col_index=-1
+    pk_info="$(get_pk_info "$meta_file")"
+    pk_col_index="${pk_info%%|*}"
     col_names=()
     col_types=()
     i=0
@@ -397,9 +530,6 @@ function update_record() {
         base_col_type=${col_type%%:*}
         col_names+=("$col_name")
         col_types+=("$base_col_type")
-        if [[ "$col_type" == *:pk ]]; then
-            pk_col_index=$i
-        fi
         ((i++))
     done < "$meta_file"
 
@@ -418,12 +548,14 @@ function update_record() {
             return
         fi
 
+        pk_value="$(normalize_value "$pk_value")"
+
         if ! validate_value_by_type "$pk_value" "$pk_col_type"; then
             echo "Error: Primary key cannot be empty and must be $pk_col_type."
             continue
         fi
 
-        target_line_number=$(awk -F'|' -v pk_index=$((pk_col_index+1)) -v pk_value="$pk_value" '$pk_index == pk_value { print NR; exit }' "$data_file")
+        target_line_number=$(awk -F'|' -v pk_index=$((pk_col_index+1)) -v pk_value="$pk_value" 'function trim(s){gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s} trim($pk_index) == pk_value { print NR; exit }' "$data_file")
         if [[ -n "$target_line_number" ]]; then
             break
         fi
@@ -471,6 +603,13 @@ function update_record() {
             return
         fi
 
+        new_value="$(normalize_value "$new_value")"
+
+        if [[ "$selected_col_type" == "string" && "$new_value" == *"|"* ]]; then
+            echo "Invalid input. Character '|' is not allowed in string values."
+            continue
+        fi
+
         if ! validate_value_by_type "$new_value" "$selected_col_type"; then
             if [[ "$selected_col_type" == "int" ]]; then
                 echo "Invalid input. Expected an integer."
@@ -486,7 +625,7 @@ function update_record() {
 
         # Enforce primary key uniqueness when updating PK column
         if [[ $selected_col_index -eq $pk_col_index ]]; then
-            if awk -F'|' -v target="$target_line_number" -v pk_index=$((pk_col_index+1)) -v pk_value="$new_value" 'NR != target && $pk_index == pk_value { found=1; exit } END { exit !found }' "$data_file"; then
+            if awk -F'|' -v target="$target_line_number" -v pk_index=$((pk_col_index+1)) -v pk_value="$new_value" 'function trim(s){gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s} NR != target && trim($pk_index) == pk_value { found=1; exit } END { exit !found }' "$data_file"; then
                 echo "Error: Primary key value '$new_value' already exists. Please enter a different value."
                 continue
             fi
@@ -503,6 +642,11 @@ function update_record() {
     updated_record=${updated_record%|}
 
     awk -v target="$target_line_number" -v new_record="$updated_record" 'NR==target { $0=new_record } { print }' "$data_file" > "$data_file.tmp" && mv "$data_file.tmp" "$data_file"
+
+    if ! sort_data_file_by_pk "$meta_file" "$data_file"; then
+        echo "Warning: Record updated, but failed to reorder data by primary key."
+        return
+    fi
 
     echo "Record updated successfully."
 }

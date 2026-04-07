@@ -1,8 +1,10 @@
 #!/bin/bash
 
-source table.sh
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-DB_ROOT="./databases"
+source "$SCRIPT_DIR/table.sh"
+
+DB_ROOT="$SCRIPT_DIR/databases"
 
 mkdir -p "$DB_ROOT"
 
@@ -47,7 +49,12 @@ function create_database() {
 
 function list_databases() {
     echo "Available Databases:"
-    ls "$DB_ROOT"
+    dbs=$(find "$DB_ROOT" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | sort)
+    if [[ -z "$dbs" ]]; then
+        echo "(none)"
+        return
+    fi
+    echo "$dbs"
 }
 
 function connect_database() {
